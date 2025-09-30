@@ -1,17 +1,16 @@
-//
-//  PomodoroAppApp.swift
-//  PomodoroApp
-//
-//  Created by Ashraful Alam on 9/30/25.
-//
-
 import SwiftUI
 
 @main
-struct PomodoroAppApp: App {
+struct MyTimelineApp: App {
     var body: some Scene {
         WindowGroup {
-            ContentView()
+            // PomodoroTrackerView now manages its own data state internally,
+            // so we can create it directly without passing any data.
+            PomodoroTrackerView()
         }
     }
+}
+
+#Preview {
+    PomodoroTrackerView()
 }
