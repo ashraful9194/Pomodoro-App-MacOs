@@ -9,14 +9,15 @@ import AppKit
 
 // MARK: - Data Models & Enums
 
-// A new struct to represent a specific slice of productive time within an hour.
+// ProductiveSegment now requires a non-optional category.
 struct ProductiveSegment: Identifiable, Codable, Equatable {
     let id = UUID()
-    let startMinute: Int // Minute of the hour the session started (0-59)
+    let startMinute: Int
     let durationMinutes: Int
+    let category: String
 }
 
-// 'HourBlock' now holds an array of these segments instead of a single boolean.
+// HourBlock remains structurally the same but now contains the new ProductiveSegment.
 struct HourBlock: Identifiable, Codable, Equatable {
     let id = UUID()
     let hour: Int
@@ -36,14 +37,15 @@ enum TimerMode {
     }
 }
 
-// Updated container for all persisted data.
+// "tags" has been renamed to "categories" for clarity.
 struct AppData: Codable {
     var productivityData: [String: [HourBlock]]
     var productiveSessionCount: Int
-    var dailyGoalMinutes: Int // New: User's daily productivity target
+    var dailyGoalMinutes: Int
+    var categories: [String]
     
     static var `default`: AppData {
-        AppData(productivityData: [:], productiveSessionCount: 0, dailyGoalMinutes: 120) // Default to 2 hours
+        AppData(productivityData: [:], productiveSessionCount: 0, dailyGoalMinutes: 120, categories: ["Work", "Study", "Reading"])
     }
 }
 
@@ -87,7 +89,11 @@ struct PomodoroTrackerView: View {
     @State private var showingChartView = false
     @State private var currentStreak: Int = 0
     
-    // New macOS-specific state for the "Keep on Top" feature
+    // State for the new, integrated category selection.
+    @State private var selectedCategoryForSession: String? = nil
+    @State private var newCategoryInput: String = ""
+    
+    // macOS-specific state
     @State private var keepOnTop = false
     
     @Environment(\.scenePhase) private var scenePhase
@@ -117,7 +123,9 @@ struct PomodoroTrackerView: View {
         .onAppear(perform: onAppear)
         .onReceive(timer, perform: { _ in handleTimerTick() })
         .alert("Custom Duration", isPresented: $showingCustomTimeAlert) { customDurationAlert }
-        .sheet(isPresented: $showingChartView) { ProductivityChartView(productivityData: appData.productivityData) }
+        .sheet(isPresented: $showingChartView) {
+            ProductivityChartView(productivityData: appData.productivityData, allCategories: appData.categories)
+        }
         .onChange(of: scenePhase) { newPhase in
             if newPhase == .background || newPhase == .inactive {
                 saveData()
@@ -127,7 +135,6 @@ struct PomodoroTrackerView: View {
             saveData()
             updateStreak()
         }
-        // New: This `onChange` will trigger the window level change on macOS
         .onChange(of: keepOnTop, perform: { isOn in
             #if os(macOS)
             setWindowFloating(isOn)
@@ -140,35 +147,40 @@ struct PomodoroTrackerView: View {
     private var headerView: some View {
         VStack {
             HStack {
-                // On macOS, add a toggle to control the floating window.
                 #if os(macOS)
-                Toggle(isOn: $keepOnTop) {
-                    Image(systemName: "pin.fill")
-                }
-                .toggleStyle(.button)
+                Toggle(isOn: $keepOnTop) { Image(systemName: "pin.fill") }.toggleStyle(.button)
                 #endif
-                
                 Spacer()
-                Text(timerMode.title)
-                    .font(.largeTitle.bold())
+                Text(timerMode.title).font(.largeTitle.bold())
                 Spacer()
                 Button(action: { showingChartView = true }) {
-                    Image(systemName: "chart.bar.xaxis")
-                        .font(.title2)
-                }
-                .buttonStyle(PlainButtonStyle())
+                    Image(systemName: "chart.bar.xaxis").font(.title2)
+                }.buttonStyle(PlainButtonStyle())
             }
             .padding(.top)
 
             Text(timeString(from: timeRemaining))
                 .font(.system(size: 80, weight: .thin, design: .monospaced))
-                .padding(.vertical, 10)
+                .padding(.vertical, 5)
+            
+            // Display the selected category while the timer is running.
+            if isTimerRunning && timerMode == .work, let category = selectedCategoryForSession {
+                Text("Category: \(category)")
+                    .font(.headline)
+                    .foregroundColor(.secondary)
+                    .transition(.opacity.animation(.easeInOut))
+            } else {
+                // Add a placeholder to prevent UI from jumping.
+                Text(" ")
+                    .font(.headline)
+            }
         }
     }
     
     private var timerControlsView: some View {
         VStack {
             if timerMode == .work {
+                // Duration selection
                 HStack(spacing: 10) {
                     ForEach(presetDurationsInMinutes, id: \.self) { minutes in
                         Button("\(minutes) min") { selectDuration(minutes: minutes) }
@@ -183,18 +195,65 @@ struct PomodoroTrackerView: View {
                 .padding(.bottom, 20)
                 .disabled(isTimerRunning)
                 .opacity(isTimerRunning ? 0.5 : 1.0)
+                
+                // Category selector is now embedded here
+                if !isTimerRunning {
+                    VStack(spacing: 12) {
+                        Text("Select or Add a Category")
+                            .font(.subheadline)
+                            .foregroundColor(.secondary)
+                        
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            HStack(spacing: 8) {
+                                ForEach(appData.categories, id: \.self) { category in
+                                    Button(category) {
+                                        selectedCategoryForSession = category
+                                    }
+                                    .buttonStyle(PresetButtonStyle(isSelected: selectedCategoryForSession == category))
+                                }
+                            }
+                            .padding(.horizontal)
+                        }
+                        .frame(height: 35)
+
+                        HStack {
+                            TextField("New Category...", text: $newCategoryInput)
+                                .textFieldStyle(.roundedBorder)
+                            Button("Add", action: addCategoryAndSelect)
+                                .disabled(newCategoryInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        }
+                        .padding(.horizontal)
+                    }
+                    .padding(.bottom, 20)
+                    .transition(.opacity)
+                }
             }
+            
             HStack(spacing: 20) {
-                Button(action: toggleTimer) {
+                Button(action: {
+                    if isTimerRunning {
+                        // Pause action
+                        isTimerRunning = false
+                        SoundManager.shared.playSound(named: "timerPause")
+                    } else {
+                        // Start action
+                        isTimerRunning = true
+                        SoundManager.shared.playSound(named: "timerStart")
+                    }
+                }) {
                     Text(isTimerRunning ? "Pause" : "Start")
                         .font(.headline).frame(minWidth: 100).padding()
                         .background(isTimerRunning ? Color.orange : Color.green).foregroundColor(.white).cornerRadius(12)
-                }.buttonStyle(PlainButtonStyle())
+                }
+                .buttonStyle(PlainButtonStyle())
+                .disabled(timerMode == .work && !isTimerRunning && selectedCategoryForSession == nil)
+                
                 Button(action: resetTimer) {
                     Image(systemName: "arrow.clockwise")
                         .font(.headline).frame(width: 40, height: 40).padding(5)
                         .background(Color.gray.opacity(0.3)).foregroundColor(.primary).cornerRadius(12)
                 }.buttonStyle(PlainButtonStyle())
+                
                 if timerMode != .work {
                     Button("Skip Break") { skipBreak() }
                         .font(.headline).padding().frame(height: 54)
@@ -202,6 +261,8 @@ struct PomodoroTrackerView: View {
                 }
             }
         }
+        .animation(.easeInOut, value: isTimerRunning)
+        .animation(.easeInOut, value: timerMode)
     }
 
     private var timelineView: some View {
@@ -258,7 +319,11 @@ struct PomodoroTrackerView: View {
     private func moveToNextMode() {
         if timerMode == .work {
             SoundManager.shared.playSound(named: "sessionComplete")
-            logProductiveSession()
+            
+            // Log the session using the category selected *before* the timer started.
+            // The force-unwrap is safe because a session cannot start without a category.
+            logProductiveSession(duration: selectedDuration, category: selectedCategoryForSession!)
+
             appData.productiveSessionCount += 1
             if appData.productiveSessionCount >= sessionsPerLongBreak {
                 appData.productiveSessionCount = 0
@@ -268,25 +333,34 @@ struct PomodoroTrackerView: View {
                 timerMode = .shortBreak
                 timeRemaining = shortBreakDuration
             }
-        } else {
+            isTimerRunning = true // Automatically start the break.
+            SoundManager.shared.playSound(named: "timerStart")
+            saveData()
+        } else { // End of a break
             SoundManager.shared.playSound(named: "breakComplete")
             timerMode = .work
             timeRemaining = selectedDuration
+            selectedCategoryForSession = nil // Reset category for the next work session.
         }
-        if timerMode != .work {
-            isTimerRunning = true
-            SoundManager.shared.playSound(named: "timerStart")
-        }
-        saveData()
     }
     
-    private func toggleTimer() {
-        isTimerRunning.toggle()
-        SoundManager.shared.playSound(named: isTimerRunning ? "timerStart" : "timerPause")
+    private func addCategoryAndSelect() {
+        let trimmedCategory = newCategoryInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedCategory.isEmpty else { return }
+        
+        if !appData.categories.contains(trimmedCategory) {
+            appData.categories.append(trimmedCategory)
+        }
+        selectedCategoryForSession = trimmedCategory
+        newCategoryInput = ""
     }
-
+    
     private func resetTimer() {
         isTimerRunning = false
+        if timerMode == .work {
+            // Also reset the selected category.
+            selectedCategoryForSession = nil
+        }
         switch timerMode {
         case .work: timeRemaining = selectedDuration
         case .shortBreak: timeRemaining = shortBreakDuration
@@ -305,19 +379,15 @@ struct PomodoroTrackerView: View {
         timerMode = .work
         timeRemaining = selectedDuration
         isTimerRunning = false
+        selectedCategoryForSession = nil // Reset category
     }
     
     // MARK: - macOS Specific Window Logic
     
     #if os(macOS)
     private func setWindowFloating(_ floating: Bool) {
-        // This accesses the key window of the entire application.
         if let window = NSApplication.shared.keyWindow {
-            if floating {
-                window.level = .floating // Makes the window float above others.
-            } else {
-                window.level = .normal // Returns it to the standard window level.
-            }
+            window.level = floating ? .floating : .normal
         }
     }
     #endif
@@ -343,24 +413,82 @@ struct PomodoroTrackerView: View {
             setupInitialData()
             return
         }
+
+        // Define structs for migrating from the previous version with optional tags.
+        struct AppDataV2: Codable {
+            var productivityData: [String: [HourBlockV2]]
+            var productiveSessionCount: Int
+            var dailyGoalMinutes: Int
+            var tags: [String]
+        }
+        struct HourBlockV2: Codable, Identifiable {
+            let id: UUID
+            let hour: Int
+            var productiveSegments: [ProductiveSegmentV2]
+        }
+        struct ProductiveSegmentV2: Codable, Identifiable {
+            let id: UUID
+            let startMinute: Int
+            let durationMinutes: Int
+            var tag: String?
+        }
+        
         do {
             let data = try Data(contentsOf: dataFileURL)
+            // Attempt to decode the new format first.
             appData = try JSONDecoder().decode(AppData.self, from: data)
         } catch {
-            print("Error loading data: \(error.localizedDescription)")
-            appData = .default
+            // If it fails, attempt to decode and migrate the previous format.
+            do {
+                let data = try Data(contentsOf: dataFileURL)
+                let oldData = try JSONDecoder().decode(AppDataV2.self, from: data)
+                
+                var migratedProductivityData: [String: [HourBlock]] = [:]
+                let defaultCategory = "Uncategorized"
+                
+                for (dateKey, hourBlocksV2) in oldData.productivityData {
+                    var newHourBlocks: [HourBlock] = []
+                    for blockV2 in hourBlocksV2 {
+                        let newSegments = blockV2.productiveSegments.map { segmentV2 -> ProductiveSegment in
+                            ProductiveSegment(startMinute: segmentV2.startMinute, durationMinutes: segmentV2.durationMinutes, category: segmentV2.tag ?? defaultCategory)
+                        }
+                        newHourBlocks.append(HourBlock(hour: blockV2.hour, productiveSegments: newSegments))
+                    }
+                    migratedProductivityData[dateKey] = newHourBlocks
+                }
+                
+                var migratedCategories = oldData.tags
+                if !migratedCategories.contains(defaultCategory) {
+                    migratedCategories.append(defaultCategory)
+                }
+                
+                appData = AppData(
+                    productivityData: migratedProductivityData,
+                    productiveSessionCount: oldData.productiveSessionCount,
+                    dailyGoalMinutes: oldData.dailyGoalMinutes,
+                    categories: migratedCategories
+                )
+                
+                saveData() // Save the newly migrated data immediately.
+                print("Successfully migrated data to new category format.")
+                
+            } catch {
+                print("Could not decode any known data format. Resetting to default. Error: \(error)")
+                appData = .default
+            }
         }
+        
         setupInitialData()
     }
     
     // MARK: - Productivity & Streak Logic
     
-    private func logProductiveSession() {
+    private func logProductiveSession(duration: Int, category: String) {
         let todayKey = dateKey(for: Date())
         let now = Date()
         let calendar = Calendar.current
-        let durationMinutes = selectedDuration / 60
-        guard durationMinutes > 0, let sessionStartDate = calendar.date(byAdding: .second, value: -selectedDuration, to: now) else { return }
+        let durationMinutes = duration / 60
+        guard durationMinutes > 0, let sessionStartDate = calendar.date(byAdding: .second, value: -duration, to: now) else { return }
         
         if appData.productivityData[todayKey] == nil {
             appData.productivityData[todayKey] = (0...23).map { HourBlock(hour: $0, productiveSegments: []) }
@@ -371,19 +499,19 @@ struct PomodoroTrackerView: View {
         if startHour == endHour {
             if let hourIndex = appData.productivityData[todayKey]?.firstIndex(where: { $0.hour == startHour }) {
                 let startMinute = calendar.component(.minute, from: sessionStartDate)
-                let newSegment = ProductiveSegment(startMinute: startMinute, durationMinutes: durationMinutes)
+                let newSegment = ProductiveSegment(startMinute: startMinute, durationMinutes: durationMinutes, category: category)
                 appData.productivityData[todayKey]?[hourIndex].productiveSegments.append(newSegment)
             }
         } else {
             if let startIndex = appData.productivityData[todayKey]?.firstIndex(where: { $0.hour == startHour }) {
                 let startMinute = calendar.component(.minute, from: sessionStartDate)
-                let segment = ProductiveSegment(startMinute: startMinute, durationMinutes: 60 - startMinute)
+                let segment = ProductiveSegment(startMinute: startMinute, durationMinutes: 60 - startMinute, category: category)
                 appData.productivityData[todayKey]?[startIndex].productiveSegments.append(segment)
             }
             if let endIndex = appData.productivityData[todayKey]?.firstIndex(where: { $0.hour == endHour }) {
                 let endMinute = calendar.component(.minute, from: now)
                 if endMinute > 0 {
-                    let segment = ProductiveSegment(startMinute: 0, durationMinutes: endMinute)
+                    let segment = ProductiveSegment(startMinute: 0, durationMinutes: endMinute, category: category)
                     appData.productivityData[todayKey]?[endIndex].productiveSegments.append(segment)
                 }
             }
@@ -489,42 +617,24 @@ struct PomodoroTrackerView: View {
 
 // MARK: - Helper Subviews & Styles
 
-// New view to encapsulate goal setting and streak display
 struct GoalAndStreakView: View {
     @Binding var dailyGoalMinutes: Int
     let currentStreak: Int
     
-    // Converts minutes to a user-friendly hour string (e.g., "2.5h")
     private var goalInHours: String {
         String(format: "%.1fh", Double(dailyGoalMinutes) / 60.0)
     }
     
     var body: some View {
         HStack {
-            // Streak Display
             VStack(alignment: .leading) {
-                Text("🔥 Current Streak")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                Text("\(currentStreak) Days")
-                    .font(.title2.bold())
-                    .foregroundColor(currentStreak > 0 ? .orange : .primary)
+                Text("🔥 Current Streak").font(.caption).foregroundColor(.secondary)
+                Text("\(currentStreak) Days").font(.title2.bold()).foregroundColor(currentStreak > 0 ? .orange : .primary)
             }
-            
             Spacer()
-            
-            // Goal Setting
             VStack(alignment: .trailing) {
-                Text("Daily Goal")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                Stepper(
-                    "\(goalInHours)",
-                    value: $dailyGoalMinutes,
-                    in: 30...720, // From 30 mins to 12 hours
-                    step: 30       // In 30-minute increments
-                )
-                .frame(width: 150)
+                Text("Daily Goal").font(.caption).foregroundColor(.secondary)
+                Stepper("\(goalInHours)", value: $dailyGoalMinutes, in: 30...720, step: 30).frame(width: 150)
             }
         }
         .padding(.vertical, 10)
@@ -543,7 +653,6 @@ struct PresetButtonStyle: ButtonStyle {
     }
 }
 
-// Updated to change background based on goal completion
 struct DailyTimelineView: View {
     let hourBlocks: [HourBlock]
     let dailyGoalMinutes: Int
@@ -555,13 +664,10 @@ struct DailyTimelineView: View {
         let goalMet = totalMinutes >= dailyGoalMinutes
         
         if calendar.isDateInToday(date) {
-            // Today's color: Green if goal is met, otherwise neutral
             return goalMet ? Color.green.opacity(0.2) : Color.secondary.opacity(0.1)
         } else if date < Date() {
-            // Past day's color: Gold for success, Red for failure
             return goalMet ? Color.yellow.opacity(0.25) : Color.red.opacity(0.2)
         } else {
-            // Future day's color: Neutral
             return Color.secondary.opacity(0.1)
         }
     }
@@ -578,7 +684,7 @@ struct DailyTimelineView: View {
             }
         }
         .frame(height: 120)
-        .background(backgroundColor) // Dynamic background color
+        .background(backgroundColor)
         .cornerRadius(12)
         .padding(.horizontal)
         .animation(.easeInOut, value: backgroundColor)
@@ -606,7 +712,7 @@ struct HourBlockView: View {
             }
             .foregroundColor(.secondary).lineLimit(1).minimumScaleFactor(0.6)
             ZStack(alignment: .leading) {
-                Rectangle().fill(Color.red.opacity(0.7)) // Corrected: Restored original red color
+                Rectangle().fill(Color.red.opacity(0.7))
                 GeometryReader { geometry in
                     ForEach(block.productiveSegments) { segment in
                         Rectangle().fill(Color.green)
