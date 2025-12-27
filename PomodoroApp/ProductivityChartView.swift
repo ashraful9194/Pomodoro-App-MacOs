@@ -398,8 +398,8 @@ struct ProductivityHeatmapView: View {
 
     @State private var hoveredDate: Date?
 
-    private let columns: [GridItem] = Array(repeating: .init(.flexible(), spacing: 2), count: 53)
     private let rows: [GridItem] = Array(repeating: .init(.flexible(), spacing: 2), count: 7)
+    private let cellWidth: CGFloat = 17.0 // 15 for rectangle + 2 for spacing
 
     private var yearData: (days: [Date], maxMinutes: Int) {
         guard let yearInterval = calendar.dateInterval(of: .year, for: year) else { return ([], 0) }
@@ -419,6 +419,12 @@ struct ProductivityHeatmapView: View {
         let firstDay = calendar.dateInterval(of: .year, for: year)!.start
         return (calendar.component(.weekday, from: firstDay) - calendar.firstWeekday + 7) % 7
     }
+    
+    private var totalColumns: Int {
+        let (days, _) = yearData
+        let totalCells = firstDayOffset + days.count
+        return (totalCells + 6) / 7 // Ceiling division
+    }
 
     private func tooltipText(for day: Date, minutes: Int) -> String {
         let dateFormatter = DateFormatter()
@@ -434,37 +440,40 @@ struct ProductivityHeatmapView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            monthLabels
-            
             HStack(spacing: 4) {
                 weekdayLabels
                 
-                let (days, maxMinutes) = yearData
-                
-                ScrollView(.horizontal, showsIndicators: false) {
-                    LazyHGrid(rows: rows, spacing: 2) {
-                        ForEach(0..<firstDayOffset, id: \.self) { _ in
-                            Color.clear.frame(width: 15, height: 15)
-                        }
+                ScrollView(.horizontal, showsIndicators: true) {
+                    VStack(alignment: .leading, spacing: 10) {
+                        monthLabels
+                        
+                        let (days, maxMinutes) = yearData
+                        
+                        LazyHGrid(rows: rows, spacing: 2) {
+                            ForEach(0..<firstDayOffset, id: \.self) { _ in
+                                Color.clear.frame(width: 15, height: 15)
+                            }
 
-                        ForEach(days, id: \.self) { day in
-                            let minutes = dailyTotals[day] ?? 0
-                            let opacity = maxMinutes > 0 ? Double(minutes) / Double(maxMinutes) : 0
-                            
-                            RoundedRectangle(cornerRadius: 3)
-                                .fill(minutes == 0 ? Color.gray.opacity(0.3) : Color.green.opacity(0.2 + (opacity * 0.8)))
-                                .frame(width: 15, height: 15)
-                                .anchorPreference(key: TooltipPreferenceKey.self, value: .bounds) {
-                                    hoveredDate == day ? $0 : nil
-                                }
-                                .onHover { isHovering in
-                                    if isHovering { self.hoveredDate = day }
-                                }
+                            ForEach(days, id: \.self) { day in
+                                let minutes = dailyTotals[day] ?? 0
+                                let opacity = maxMinutes > 0 ? Double(minutes) / Double(maxMinutes) : 0
+                                
+                                RoundedRectangle(cornerRadius: 3)
+                                    .fill(minutes == 0 ? Color.gray.opacity(0.3) : Color.green.opacity(0.2 + (opacity * 0.8)))
+                                    .frame(width: 15, height: 15)
+                                    .anchorPreference(key: TooltipPreferenceKey.self, value: .bounds) {
+                                        hoveredDate == day ? $0 : nil
+                                    }
+                                    .onHover { isHovering in
+                                        if isHovering { self.hoveredDate = day }
+                                    }
+                            }
+                        }
+                        .onHover { isHovering in
+                            if !isHovering { self.hoveredDate = nil }
                         }
                     }
-                    .onHover { isHovering in
-                        if !isHovering { self.hoveredDate = nil }
-                    }
+                    .fixedSize(horizontal: true, vertical: false)
                 }
             }
             HeatmapLegendView(maxMinutes: yearData.maxMinutes)
@@ -493,16 +502,49 @@ struct ProductivityHeatmapView: View {
         .frame(height: 300)
     }
     
-    private var monthLabels: some View {
-        HStack {
-            Text("J").frame(maxWidth: .infinity); Text("F").frame(maxWidth: .infinity)
-            Text("M").frame(maxWidth: .infinity); Text("A").frame(maxWidth: .infinity)
-            Text("M").frame(maxWidth: .infinity); Text("J").frame(maxWidth: .infinity)
-            Text("J").frame(maxWidth: .infinity); Text("A").frame(maxWidth: .infinity)
-            Text("S").frame(maxWidth: .infinity); Text("O").frame(maxWidth: .infinity)
-            Text("N").frame(maxWidth: .infinity); Text("D").frame(maxWidth: .infinity)
+    private struct MonthHeaderInfo: Identifiable {
+        let id = UUID()
+        let symbol: String
+        let startColumn: Int
+    }
+
+    private var monthStartColumns: [MonthHeaderInfo] {
+        guard calendar.dateInterval(of: .year, for: year) != nil else { return [] }
+        let monthSymbols = ["J", "F", "M", "A", "M", "J", "J", "A", "S", "O", "N", "D"]
+        var info: [MonthHeaderInfo] = []
+        
+        for monthIndex in 1...12 {
+            let components = DateComponents(year: calendar.component(.year, from: year), month: monthIndex, day: 1)
+            guard let firstDayOfMonth = calendar.date(from: components) else { continue }
+            
+            let dayOfYear = calendar.ordinality(of: .day, in: .year, for: firstDayOfMonth)! - 1
+            let gridIndex = firstDayOffset + dayOfYear
+            let column = gridIndex / 7
+            
+            if info.last?.startColumn != column {
+                info.append(.init(symbol: monthSymbols[monthIndex-1], startColumn: column))
+            }
         }
-        .font(.caption).foregroundColor(.secondary).padding(.leading, 30)
+        return info
+    }
+
+    private var monthLabels: some View {
+        let columns = monthStartColumns
+        
+        return HStack(spacing: 0) {
+            ForEach(columns.indices, id: \.self) { i in
+                let current = columns[i]
+                let nextStartColumn = (i + 1 < columns.count) ? columns[i+1].startColumn : totalColumns
+                let weekCount = nextStartColumn - current.startColumn
+                
+                if weekCount > 0 {
+                    Text(current.symbol)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .frame(width: CGFloat(weekCount) * cellWidth, alignment: .leading)
+                }
+            }
+        }
     }
     
     private var weekdayLabels: some View {

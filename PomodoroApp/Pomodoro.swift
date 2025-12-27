@@ -98,6 +98,9 @@ struct PomodoroTrackerView: View {
     
     @Environment(\.scenePhase) private var scenePhase
     
+    // Alert state
+    @State private var showingDeleteAlert = false
+    
     let timer = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
     // MARK: - Constants
@@ -254,6 +257,16 @@ struct PomodoroTrackerView: View {
                         .background(Color.gray.opacity(0.3)).foregroundColor(.primary).cornerRadius(12)
                 }.buttonStyle(PlainButtonStyle())
                 
+                if timerMode == .work && selectedCategoryForSession != nil {
+                    Button(action: completeSession) {
+                        Image(systemName: "checkmark")
+                            .font(.headline).frame(width: 40, height: 40).padding(5)
+                            .background(Color.green.opacity(0.3)).foregroundColor(.primary).cornerRadius(12)
+                    }
+                    .buttonStyle(PlainButtonStyle())
+                    .help("Complete Session")
+                }
+                
                 if timerMode != .work {
                     Button("Skip Break") { skipBreak() }
                         .font(.headline).padding().frame(height: 54)
@@ -272,6 +285,17 @@ struct PomodoroTrackerView: View {
                 Button(action: goToPreviousDay) { Image(systemName: "chevron.left") }.buttonStyle(PlainButtonStyle())
                 Spacer()
                 Text(formattedDate(for: displayedDate)).font(.headline)
+                
+                // Delete button
+                Button(action: { showingDeleteAlert = true }) {
+                    Image(systemName: "trash")
+                        .foregroundColor(.red)
+                }
+                .buttonStyle(PlainButtonStyle())
+                .padding(.leading, 8)
+                .disabled(blocksForDisplayedDate().allSatisfy { $0.productiveSegments.isEmpty })
+                .opacity(blocksForDisplayedDate().allSatisfy { $0.productiveSegments.isEmpty } ? 0 : 1)
+
                 Spacer()
                 Button(action: goToNextDay) { Image(systemName: "chevron.right") }
                     .buttonStyle(PlainButtonStyle())
@@ -279,6 +303,12 @@ struct PomodoroTrackerView: View {
             }
             .padding(.top)
             .padding(.horizontal)
+            .alert("Clear Data", isPresented: $showingDeleteAlert) {
+                Button("Delete", role: .destructive) { deleteDataForCurrentDay() }
+                Button("Cancel", role: .cancel) { }
+            } message: {
+                Text("Are you sure you want to delete all productivity data for \(formattedDate(for: displayedDate))? This cannot be undone.")
+            }
 
             DailyTimelineView(
                 hourBlocks: blocksForDisplayedDate(),
@@ -380,6 +410,16 @@ struct PomodoroTrackerView: View {
         timeRemaining = selectedDuration
         isTimerRunning = false
         selectedCategoryForSession = nil // Reset category
+    }
+    
+    private func completeSession() {
+        guard timerMode == .work else { return }
+        // Force timer logic to end by simulating timeRemaining = 0 logic
+        // But simply calling moveToNextMode() triggers:
+        // 1. Logging full selectedDuration
+        // 2. Switching to break
+        // 3. Starting break
+        moveToNextMode()
     }
     
     // MARK: - macOS Specific Window Logic
@@ -484,38 +524,56 @@ struct PomodoroTrackerView: View {
     // MARK: - Productivity & Streak Logic
     
     private func logProductiveSession(duration: Int, category: String) {
-        let todayKey = dateKey(for: Date())
         let now = Date()
         let calendar = Calendar.current
-        let durationMinutes = duration / 60
-        guard durationMinutes > 0, let sessionStartDate = calendar.date(byAdding: .second, value: -duration, to: now) else { return }
         
-        if appData.productivityData[todayKey] == nil {
-            appData.productivityData[todayKey] = (0...23).map { HourBlock(hour: $0, productiveSegments: []) }
-        }
-
-        let startHour = calendar.component(.hour, from: sessionStartDate)
-        let endHour = calendar.component(.hour, from: now)
-        if startHour == endHour {
-            if let hourIndex = appData.productivityData[todayKey]?.firstIndex(where: { $0.hour == startHour }) {
-                let startMinute = calendar.component(.minute, from: sessionStartDate)
-                let newSegment = ProductiveSegment(startMinute: startMinute, durationMinutes: durationMinutes, category: category)
-                appData.productivityData[todayKey]?[hourIndex].productiveSegments.append(newSegment)
+        // Ensure valid duration
+        guard duration > 0, let sessionStartDate = calendar.date(byAdding: .second, value: -duration, to: now) else { return }
+        
+        var currentPointer = sessionStartDate
+        
+        // Iterate through time until we reach 'now'
+        while currentPointer < now {
+            let key = dateKey(for: currentPointer)
+            let hour = calendar.component(.hour, from: currentPointer)
+            
+            // Ensure storage exists for this day/hour
+            if appData.productivityData[key] == nil {
+                appData.productivityData[key] = (0...23).map { HourBlock(hour: $0, productiveSegments: []) }
             }
-        } else {
-            if let startIndex = appData.productivityData[todayKey]?.firstIndex(where: { $0.hour == startHour }) {
-                let startMinute = calendar.component(.minute, from: sessionStartDate)
-                let segment = ProductiveSegment(startMinute: startMinute, durationMinutes: 60 - startMinute, category: category)
-                appData.productivityData[todayKey]?[startIndex].productiveSegments.append(segment)
+            
+            // Calculate the end of the current hour block (e.g., if it's 10:15, end is 11:00:00)
+            // We get the start of the current hour, then add 1 hour.
+            let currentHourComponents = calendar.dateComponents([.year, .month, .day, .hour], from: currentPointer)
+            guard let startOfCurrentHour = calendar.date(from: currentHourComponents),
+                  let startOfNextHour = calendar.date(byAdding: .hour, value: 1, to: startOfCurrentHour) else {
+                break
             }
-            if let endIndex = appData.productivityData[todayKey]?.firstIndex(where: { $0.hour == endHour }) {
-                let endMinute = calendar.component(.minute, from: now)
-                if endMinute > 0 {
-                    let segment = ProductiveSegment(startMinute: 0, durationMinutes: endMinute, category: category)
-                    appData.productivityData[todayKey]?[endIndex].productiveSegments.append(segment)
+            
+            // The segment for this block ends either when the hour ends, or when the session actually ended ('now').
+            let segmentEnd = min(startOfNextHour, now)
+            
+            let durationSeconds = segmentEnd.timeIntervalSince(currentPointer)
+            // Use rounding or floor? Int conversion floors. 59.9 -> 59.
+            // Let's ensure we capture at least 1 minute if it's significant, but typical Pomodoro is minutes.
+            let durationInMinutes = Int(durationSeconds / 60)
+            
+            if durationInMinutes > 0 {
+                let startMinute = calendar.component(.minute, from: currentPointer)
+                
+                if let hourIndex = appData.productivityData[key]?.firstIndex(where: { $0.hour == hour }) {
+                    let newSegment = ProductiveSegment(startMinute: startMinute, durationMinutes: durationInMinutes, category: category)
+                    appData.productivityData[key]?[hourIndex].productiveSegments.append(newSegment)
                 }
             }
+            
+            // Advance the pointer
+            currentPointer = segmentEnd
+            
+            // Safety check: if we aren't moving forward, break to prevent infinite loop
+            if durationSeconds <= 0 { break }
         }
+        
         updateStreak()
     }
     
@@ -598,6 +656,14 @@ struct PomodoroTrackerView: View {
     
     private func isToday(_ date: Date) -> Bool {
         return Calendar.current.isDateInToday(date)
+    }
+    
+    private func deleteDataForCurrentDay() {
+        let key = dateKey(for: displayedDate)
+        appData.productivityData.removeValue(forKey: key)
+        saveData()
+        updateStreak()
+        SoundManager.shared.playSound(named: "timerPause") // Feedback sound
     }
     
     private func dateKey(for date: Date) -> String {
